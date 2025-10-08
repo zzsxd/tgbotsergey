@@ -290,11 +290,29 @@ def setup_handlers(settings: Settings, subs: SubscriptionService) -> Router:
             mentions.append(f'<a href="tg://user?id={m.id}">{user_name}</a>')
         if not mentions:
             return
-        text = "Добро пожаловать, " + ", ".join(mentions) + "!"
+        text = ", ".join(mentions) + ": Привет 🦊\u202FДелай взаимку тут, и актив тебе обеспечен! Давай работать вместе! 🚀"
         try:
             sent = await message.answer(text)
             # Автоудаление приветствия через ~20 секунд
             asyncio.create_task(_delete_message_later(message.bot, message.chat.id, sent.message_id, 20))
+        except Exception:
+            pass
+
+    # Удаляем также отредактированные сообщения от неподписанных пользователей
+    @router.edited_message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+    async def guard_edited_message(message: Message) -> None:
+        if message.from_user is None or message.from_user.is_bot:
+            return
+        target_chat_id = await store.get_chat_id()
+        if target_chat_id is None:
+            return
+        if message.chat.id != target_chat_id:
+            return
+        user_id = message.from_user.id
+        if await subs.is_fully_subscribed(user_id):
+            return
+        try:
+            await message.delete()
         except Exception:
             pass
 
