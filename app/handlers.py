@@ -17,6 +17,7 @@ from .keyboards import subscription_keyboard
 from .cache import TTLMemoryCache, TTLKVCache
 from .storage import ConfigStore
 import logging
+import asyncio
 import html
 
 
@@ -28,6 +29,13 @@ logger = logging.getLogger("handlers")
 
 def setup_handlers(settings: Settings, subs: SubscriptionService) -> Router:
     store = ConfigStore(settings.config_store_path)
+    
+    async def _delete_message_later(bot: Bot, chat_id: int, message_id: int, delay_seconds: int = 20) -> None:
+        await asyncio.sleep(delay_seconds)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
     # Обрабатываем все сообщения и сверяемся с выбранным чатом динамически
     @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
     async def guard_message(message: Message) -> None:
@@ -132,11 +140,14 @@ def setup_handlers(settings: Settings, subs: SubscriptionService) -> Router:
         reminder = await message.answer(
             text=text,
             reply_markup=subscription_keyboard(urls),
+            disable_web_page_preview=True,
         )
         await _notice_cache.set_until(key, settings.notify_ttl_seconds)
         # Запоминаем id напоминания, чтобы удалить при повторной подписке (храним 1 час)
         await _last_notice_message.set(key, reminder.message_id, 3600)
         logger.info("notice sent to user %s in chat %s", user_id, message.chat.id)
+        # Автоудаление напоминания через ~20 секунд
+        asyncio.create_task(_delete_message_later(message.bot, message.chat.id, reminder.message_id, 20))
 
     # Мгновенно ограничиваем отправку сообщений при выходе из обязательного канала
     @router.chat_member(ChatMemberUpdatedFilter(IS_MEMBER >> IS_NOT_MEMBER))
@@ -223,10 +234,13 @@ def setup_handlers(settings: Settings, subs: SubscriptionService) -> Router:
                     chat_id=target_chat_id,
                     text=text,
                     reply_markup=subscription_keyboard(urls),
+                    disable_web_page_preview=True,
                 )
                 await _notice_cache.set_until(key, settings.notify_ttl_seconds)
                 await _last_notice_message.set(key, reminder.message_id, 3600)
                 logger.info("notice sent (leave event) to user %s in chat %s", user_id, target_chat_id)
+                # Автоудаление напоминания через ~20 секунд
+                asyncio.create_task(_delete_message_later(bot, target_chat_id, reminder.message_id, 20))
             except Exception:
                 # Не блокируем основной поток при ошибке отправки напоминания
                 pass
@@ -257,6 +271,32 @@ def setup_handlers(settings: Settings, subs: SubscriptionService) -> Router:
                     await _last_notice_message.delete(key)
 
     # Кнопки «Проверить подписку» нет — автоочистка работает по событию и при первом корректном сообщении
+
+    # Приветствие новых участников целевого чата
+    @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}) & F.new_chat_members)
+    async def welcome_new_members(message: Message) -> None:
+        target_chat_id = await store.get_chat_id()
+        if target_chat_id is None:
+            return
+        if message.chat.id != target_chat_id:
+            return
+        members = message.new_chat_members or []
+        mentions: list[str] = []
+        for m in members:
+            # Не приветствуем ботов
+            if getattr(m, "is_bot", False):
+                continue
+            user_name = html.escape(getattr(m, "full_name", None) or getattr(m, "first_name", None) or "участник")
+            mentions.append(f'<a href="tg://user?id={m.id}">{user_name}</a>')
+        if not mentions:
+            return
+        text = "Добро пожаловать, " + ", ".join(mentions) + "!"
+        try:
+            sent = await message.answer(text)
+            # Автоудаление приветствия через ~20 секунд
+            asyncio.create_task(_delete_message_later(message.bot, message.chat.id, sent.message_id, 20))
+        except Exception:
+            pass
 
     return router
 
