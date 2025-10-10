@@ -24,11 +24,32 @@ import html
 router = Router(name="mandatory-subscription")
 _notice_cache = TTLMemoryCache()
 _last_notice_message = TTLKVCache()
+_welcomed_cache = TTLMemoryCache()
 logger = logging.getLogger("handlers")
 
 
 def setup_handlers(settings: Settings, subs: SubscriptionService) -> Router:
     store = ConfigStore(settings.config_store_path)
+    
+    def _is_target_chat(current_chat_id: int, target_chat_id: int | None) -> bool:
+        """Сопоставляет текущий чат с целевым, учитывая варианты ID супергруппы (-id и -100id)."""
+        if target_chat_id is None:
+            return True
+        if current_chat_id == target_chat_id:
+            return True
+        # Нормализуем к абсолютным строкам без знака
+        try:
+            abs_target = str(abs(int(target_chat_id)))
+            abs_current = str(abs(int(current_chat_id)))
+        except Exception:
+            return False
+        # В конфиге -id, фактически -100id
+        if not abs_target.startswith("100") and abs_current == ("100" + abs_target):
+            return True
+        # В конфиге -100id, фактически -id
+        if abs_target.startswith("100") and abs_target[3:] == abs_current:
+            return True
+        return False
     
     async def _delete_message_later(bot: Bot, chat_id: int, message_id: int, delay_seconds: int = 20) -> None:
         await asyncio.sleep(delay_seconds)
@@ -42,15 +63,31 @@ def setup_handlers(settings: Settings, subs: SubscriptionService) -> Router:
         # Игнорируем собственные сообщения и сервисные
         if message.from_user is None or message.from_user.is_bot:
             return
+        # Игнорируем сервисные события (вступление/выход и т.п.) — для них есть отдельные хендлеры
+        if getattr(message, "new_chat_members", None) or getattr(message, "left_chat_member", None):
+            return
         target_chat_id = await store.get_chat_id()
         # Чат ещё не выбран через меню — не вмешиваемся
         if target_chat_id is None:
             logger.debug("guard_message: target_chat_id not set; skip")
             return
         # Не целевой чат — пропускаем
-        if message.chat.id != target_chat_id:
+        if not _is_target_chat(message.chat.id, target_chat_id):
             return
         user_id = message.from_user.id
+        # Резервное приветствие на первый пользовательский месседж (если join-события скрыты)
+        welcome_key = f"welcomed:{message.chat.id}:{user_id}"
+        if not await _welcomed_cache.contains(welcome_key):
+            user_name = html.escape(getattr(message.from_user, "full_name", None) or getattr(message.from_user, "first_name", None) or "участник")
+            mention = f'<a href="tg://user?id={message.from_user.id}">{user_name}</a>'
+            greet_text = mention + ": Привет 🦊\u202FДелай взаимку тут, и актив тебе обеспечен! Давай работать вместе! 🚀"
+            try:
+                sent_greet = await message.answer(greet_text)
+                asyncio.create_task(_delete_message_later(message.bot, message.chat.id, sent_greet.message_id, 20))
+                await _welcomed_cache.set_until(welcome_key, 604800)  # 7 дней
+                logger.info("guard_message: fallback greeting sent to user %s in chat %s", user_id, message.chat.id)
+            except Exception:
+                pass
         if await subs.is_fully_subscribed(user_id):
             logger.debug("guard_message: user %s is subscribed", user_id)
             # Пользователь подписан — пробуем удалить прошлое напоминание, если оно было
@@ -276,10 +313,10 @@ def setup_handlers(settings: Settings, subs: SubscriptionService) -> Router:
     @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}) & F.new_chat_members)
     async def welcome_new_members(message: Message) -> None:
         target_chat_id = await store.get_chat_id()
-        if target_chat_id is None:
+        # Если целевой чат назначен — приветствуем только там; иначе — во всех группах
+        if target_chat_id is not None and not _is_target_chat(message.chat.id, target_chat_id):
             return
-        if message.chat.id != target_chat_id:
-            return
+        logger.info("welcome_new_members: trigger in chat %s, target=%s", message.chat.id, target_chat_id)
         members = message.new_chat_members or []
         mentions: list[str] = []
         for m in members:
@@ -295,6 +332,41 @@ def setup_handlers(settings: Settings, subs: SubscriptionService) -> Router:
             sent = await message.answer(text)
             # Автоудаление приветствия через ~20 секунд
             asyncio.create_task(_delete_message_later(message.bot, message.chat.id, sent.message_id, 20))
+            logger.info("welcome_new_members: sent greeting to %s in chat %s", mentions, message.chat.id)
+        except Exception:
+            pass
+        # Помечаем пользователей как уже поприветствованных
+        for m in members:
+            try:
+                await _welcomed_cache.set_until(f"welcomed:{message.chat.id}:{m.id}", 604800)
+            except Exception:
+                pass
+
+    # Резервное приветствие по событию изменения статуса участника (если сервисное сообщение не пришло)
+    @router.chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> IS_MEMBER))
+    async def welcome_on_chat_member(event: ChatMemberUpdated, bot: Bot) -> None:
+        chat = event.chat
+        if getattr(chat, "type", None) not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            return
+        target_chat_id = await store.get_chat_id()
+        if target_chat_id is not None and not _is_target_chat(chat.id, target_chat_id):
+            return
+        logger.info("welcome_on_chat_member: trigger in chat %s, target=%s", chat.id, target_chat_id)
+        user = event.new_chat_member.user
+        if getattr(user, "is_bot", False):
+            return
+        user_name = html.escape(getattr(user, "full_name", None) or getattr(user, "first_name", None) or "участник")
+        mention = f'<a href="tg://user?id={user.id}">{user_name}</a>'
+        text = mention + ": Привет 🦊\u202FДелай взаимку тут, и актив тебе обеспечен! Давай работать вместе! 🚀"
+        try:
+            sent = await bot.send_message(chat_id=chat.id, text=text)
+            asyncio.create_task(_delete_message_later(bot, chat.id, sent.message_id, 20))
+            logger.info("welcome_on_chat_member: sent greeting to user %s in chat %s", user.id, chat.id)
+        except Exception:
+            pass
+        # Помечаем как поприветствованного
+        try:
+            await _welcomed_cache.set_until(f"welcomed:{chat.id}:{user.id}", 604800)
         except Exception:
             pass
 
@@ -306,7 +378,7 @@ def setup_handlers(settings: Settings, subs: SubscriptionService) -> Router:
         target_chat_id = await store.get_chat_id()
         if target_chat_id is None:
             return
-        if message.chat.id != target_chat_id:
+        if not _is_target_chat(message.chat.id, target_chat_id):
             return
         user_id = message.from_user.id
         if await subs.is_fully_subscribed(user_id):
